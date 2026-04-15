@@ -1,0 +1,1339 @@
+/**
+ * modules/game.js
+ * ゲームロジック・ラウンド管理・DB保存
+ */
+
+const crypto = require('crypto');
+const zlib = require('zlib');
+const WebSocket = require('ws');
+
+const config = require('./config');
+const {
+    fs, os, dbPool,
+    GAME_DURATION, RESPAWN_TIME, PLAYER_SPEED, GRID_SIZE, AFK_DEATH_LIMIT, MINIMAP_SIZE,
+    EMOJIS, GAME_MODES, TEAM_COLORS,
+    DEBUG_MODE, INNER_DEBUG_MODE, FORCE_TEAM, STATS_MODE, HELL_OBSTACLES, GEAR_ENABLED,
+    state, bandwidthStats, resetBandwidthStats
+} = config;
+
+// 障害物判定ヘルパー
+function isObstacleCell(val) { return val === 'obstacle' || val === 'obstacle_gear' ; }//‼️|| val === 99
+
+// サーバー起動時刻
+const serverStartTime = Date.now();
+
+// wss参照（後から設定）
+let wss = null;
+function setWss(wssInstance) { wss = wssInstance; }
+
+// ============================================================
+// ヘルパー関数
+// ============================================================
+
+// 空間グリッド + Union-Find によるrectクラスタリング（O(N)）
+// rectList: [{x, y, w, h, ...}], mergeDistance: マージ距離
+// 戻り値: [{ totalArea, centerX, centerY }, ...]
+function clusterRectsUnionFind(rectList, mergeDistance) {
+    const n = rectList.length;
+    if (n === 0) return [];
+
+    const cellSize = mergeDistance;
+    const spatialMap = new Map();
+
+    // Step 1: 空間グリッドにバケット分類 O(N)
+    for (let i = 0; i < n; i++) {
+        const r = rectList[i];
+        const cx = Math.floor((r.x + r.w / 2) / cellSize);
+        const cy = Math.floor((r.y + r.h / 2) / cellSize);
+        const key = cy * 100000 + cx;
+        let bucket = spatialMap.get(key);
+        if (!bucket) { bucket = []; spatialMap.set(key, bucket); }
+        bucket.push(i);
+    }
+
+    // Step 2: Union-Find
+    const parent = new Int32Array(n);
+    const rank = new Uint8Array(n);
+    const area = new Float64Array(n);
+    const sumX = new Float64Array(n);
+    const sumY = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+        parent[i] = i;
+        const r = rectList[i];
+        const a = r.w * r.h;
+        area[i] = a;
+        sumX[i] = (r.x + r.w / 2) * a;
+        sumY[i] = (r.y + r.h / 2) * a;
+    }
+    function find(x) {
+        while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+        return x;
+    }
+    function union(a, b) {
+        a = find(a); b = find(b);
+        if (a === b) return;
+        if (rank[a] < rank[b]) { const t = a; a = b; b = t; }
+        parent[b] = a;
+        if (rank[a] === rank[b]) rank[a]++;
+        area[a] += area[b];
+        sumX[a] += sumX[b];
+        sumY[a] += sumY[b];
+    }
+
+    // Step 3: 同一セル内・隣接セル間でマージ O(N * k)
+    const distSq = mergeDistance * mergeDistance;
+    const neighborOffsets = [0, 1, -1, 100000, -100000, 100001, 99999, -99999, -100001];
+    spatialMap.forEach((indices, key) => {
+        // 同一セル内は全ペアをマージ
+        for (let a = 0; a < indices.length; a++) {
+            for (let b = a + 1; b < indices.length; b++) {
+                union(indices[a], indices[b]);
+            }
+        }
+        // 隣接セル（右、下、右下、左下の4方向のみ = 重複なし）
+        const checkDirs = [1, 100000, 100001, 99999];
+        for (const dir of checkDirs) {
+            const neighbor = spatialMap.get(key + dir);
+            if (!neighbor) continue;
+            for (const ai of indices) {
+                const ra = rectList[ai];
+                const raCx = ra.x + ra.w / 2;
+                const raCy = ra.y + ra.h / 2;
+                for (const bi of neighbor) {
+                    const rb = rectList[bi];
+                    const dx = raCx - (rb.x + rb.w / 2);
+                    const dy = raCy - (rb.y + rb.h / 2);
+                    if (dx * dx + dy * dy < distSq) union(ai, bi);
+                }
+            }
+        }
+    });
+
+    // Step 4: クラスタ収集
+    const clusterMap = new Map();
+    for (let i = 0; i < n; i++) {
+        clusterMap.set(find(i), true);
+    }
+    const clusters = [];
+    clusterMap.forEach((_, root) => {
+        clusters.push({
+            totalArea: area[root],
+            centerX: sumX[root] / area[root],
+            centerY: sumY[root] / area[root]
+        });
+    });
+    return clusters;
+}
+
+// generateId は generateShortId のエイリアス（フルID廃止に伴い統一）
+function generateId() { return generateShortId(); }
+
+function getHueFromHex(hex) {
+    if (!hex || hex.length !== 7) return 0;
+    let r = parseInt(hex.substring(1, 3), 16) / 255;
+    let g = parseInt(hex.substring(3, 5), 16) / 255;
+    let b = parseInt(hex.substring(5, 7), 16) / 255;
+    let max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h = 0;
+    if (max !== min) {
+        let d = max - min;
+        switch (max) {
+            case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+            case g: h = (b - r) / d + 2; break;
+            case b: h = (r - g) / d + 4; break;
+        }
+        h /= 6;
+    }
+    return h * 360;
+}
+
+// 64色固定パレット（5.625°間隔、彩度・明度を色相ごとに調整して視認性確保）
+const PALETTE_SIZE = 64;
+const COLOR_PALETTE = (function() {
+    const defs = [];
+    for (let i = 0; i < PALETTE_SIZE; i++) {
+        const h = (i * 360 / PALETTE_SIZE) % 360;
+        let s = 80, l = 55;
+        if (h >= 48 && h <= 96) { s = 85; l = 45; }
+        if (h >= 216 && h <= 276) { s = 75; l = 60; }
+        defs.push(_hslToHex(h, s, l));
+    }
+    return defs;
+})();
+const _PALETTE_HUES = Array.from({ length: PALETTE_SIZE }, (_, i) => (i * 360 / PALETTE_SIZE) % 360);
+const MIN_HUE_DIST = 30;
+
+// 色相距離を計算（0-180）
+function _hueDist(a, b) {
+    let d = Math.abs(a - b);
+    return d > 180 ? 360 - d : d;
+}
+
+// 既存色リストとの最小色相距離を返す
+function _minHueDist(hue, existingHues) {
+    let min = 360;
+    for (const eh of existingHues) {
+        const d = _hueDist(hue, eh);
+        if (d < min) min = d;
+    }
+    return min;
+}
+
+// ランダムにパレットから選び、既存色と近すぎたら別の色にする
+function _pickFromPalette(existingHues) {
+    if (existingHues.length === 0) {
+        return COLOR_PALETTE[Math.floor(Math.random() * COLOR_PALETTE.length)];
+    }
+    // シャッフルしたインデックスで試行
+    const indices = Array.from({ length: PALETTE_SIZE }, (_, i) => i);
+    for (let i = indices.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    // MIN_HUE_DIST以上離れた色を探す
+    for (const idx of indices) {
+        if (_minHueDist(_PALETTE_HUES[idx], existingHues) >= MIN_HUE_DIST) {
+            return COLOR_PALETTE[idx];
+        }
+    }
+    // 全部近い場合（30人超）→ 最も離れた色を選ぶ
+    let bestIdx = indices[0], bestDist = -1;
+    for (const idx of indices) {
+        const d = _minHueDist(_PALETTE_HUES[idx], existingHues);
+        if (d > bestDist) { bestDist = d; bestIdx = idx; }
+    }
+    return COLOR_PALETTE[bestIdx];
+}
+
+// チーム色を取得
+function getTeamColor(teamName) {
+    if (TEAM_COLORS[teamName]) return TEAM_COLORS[teamName];
+    const teammate = Object.values(state.players).find(p => p.team === teamName && p.color);
+    if (teammate) return teammate.color;
+    // 他チームの色を収集（チーム単位で1色）
+    const teamColorMap = new Map();
+    Object.values(state.players).forEach(p => {
+        if (p.team && p.color && !teamColorMap.has(p.team)) {
+            teamColorMap.set(p.team, getHueFromHex(p.color));
+        }
+    });
+    return _pickFromPalette(Array.from(teamColorMap.values()));
+}
+
+// 個人色を取得
+function getUniqueColor() {
+    const existingHues = Object.values(state.players)
+        .filter(p => p.color)
+        .map(p => getHueFromHex(p.color));
+    return _pickFromPalette(existingHues);
+}
+
+function _hslToHex(h, s, l) {
+    const aa = s * Math.min(l / 100, 1 - l / 100) / 100;
+    const f = n => {
+        const k = (n + h / 30) % 12;
+        const c = l / 100 - aa * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+        return Math.round(255 * c).toString(16).padStart(2, '0');
+    };
+    return `#${f(0)}${f(8)}${f(4)}`;
+}
+
+function getRandomEmoji() { return EMOJIS[Math.floor(Math.random() * EMOJIS.length)]; }
+function toGrid(val) { return Math.floor(val / GRID_SIZE); }
+
+function getDistSq(px, py, vx, vy, wx, wy) {
+    const l2 = (vx - wx) ** 2 + (vy - wy) ** 2;
+    if (l2 === 0) return (px - vx) ** 2 + (py - vy) ** 2;
+    let t = ((px - vx) * (wx - vx) + (py - vy) * (wy - vy)) / l2;
+    t = Math.max(0, Math.min(1, t));
+    return (px - (vx + t * (wx - vx))) ** 2 + (py - (vy + t * (wy - vy))) ** 2;
+}
+
+function formatBytes(bytes) {
+    if (bytes < 1024) return bytes.toFixed(0) + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+    return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+function formatTime(sec) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    if (h > 0) return `${h}時間${m}分${s}秒`;
+    return `${m}分${s}秒`;
+}
+
+// Short ID管理
+function generateShortId() {
+    let limit = 65535;
+    while (limit > 0) {
+        const id = state.nextShortId++;
+        if (state.nextShortId > 65535) state.nextShortId = 1;
+        if (!state.usedShortIds.has(id)) {
+            state.usedShortIds.add(id);
+            return id;
+        }
+        limit--;
+    }
+    return 0;
+}
+
+// ============================================================
+// Grid初期化
+// ============================================================
+function initGrid() {
+    const pCount = Object.keys(state.players).length;
+    const baseSize = 2000;
+    const size = Math.min(5000, Math.max(1500, baseSize + pCount * 100));
+    state.WORLD_WIDTH = size;
+    state.WORLD_HEIGHT = size;
+    state.GRID_COLS = Math.ceil(state.WORLD_WIDTH / GRID_SIZE);
+    state.GRID_ROWS = Math.ceil(state.WORLD_HEIGHT / GRID_SIZE);
+
+    state.worldGrid = Array(state.GRID_ROWS).fill(null).map(() => Array(state.GRID_COLS).fill(null));
+    state.obstacles = [];
+    state.gears = [];  // 回転歯車リスト
+
+    // 通常障害物の数
+    const normalCount = HELL_OBSTACLES ? 80 : 15;
+
+    for (let i = 0; i < normalCount; i++) {
+        let w, h;
+        //壁のサイズ（幅 w と高さ h）を計算する
+        if (HELL_OBSTACLES) {
+            // 鬼モード: 多彩なサイズ（細長い壁も含む）
+            if (Math.random() < 0.3) {
+                // 細長い壁
+                w = Math.random() < 0.5 ? Math.floor(1 + Math.random() * 2) : Math.floor(8 + Math.random() * 15);
+                h = w > 3 ? Math.floor(1 + Math.random() * 2) : Math.floor(8 + Math.random() * 15);
+            } else {
+                w = Math.floor(2 + Math.random() * 6);
+                h = Math.floor(2 + Math.random() * 6);
+            }
+        } else {
+            w = Math.floor(2 + Math.random() * 5);
+            h = Math.floor(2 + Math.random() * 5);
+        }
+        //壁を置く場所（gx, gy）をランダムに決める
+        let gx = Math.floor(Math.random() * (state.GRID_COLS - w));
+        let gy = Math.floor(Math.random() * (state.GRID_ROWS - h));
+        //「見た目」のリストに追加する
+        state.obstacles.push({
+            x: gx * GRID_SIZE, y: gy * GRID_SIZE,
+            width: w * GRID_SIZE, height: h * GRID_SIZE, type: 'rect'
+        });
+        //「当たり判定」を刻み込む（2重ループ）
+        for (let y = gy; y < gy + h; y++) {
+            for (let x = gx; x < gx + w; x++) {
+                if (y >= 0 && y < state.GRID_ROWS && x >= 0 && x < state.GRID_COLS) {
+                    state.worldGrid[y][x] = 'obstacle';
+                }
+            }
+        }
+    }
+    //‼️
+    // === 泉の生成 ===
+    const currentMode = GAME_MODES[state.currentModeIdx]; // 現在のモード名を取得
+    if (currentMode === 'TREE') {
+    state.fountains = []; // ‼️ 以前のラウンドの泉情報をクリア！
+    const TOTAL_FOUNTAINS = 30;
+    const LV3_RATIO = 0.1;
+    const LV2_RATIO = 0.3;
+
+    const levels = [
+        { id: 3, r: 9, count: Math.round(TOTAL_FOUNTAINS * LV3_RATIO) },
+        { id: 2, r: 6, count: Math.round(TOTAL_FOUNTAINS * LV2_RATIO) },
+        { id: 1, r: 3, count: 0 }
+    ];
+    levels[2].count = TOTAL_FOUNTAINS - levels[0].count - levels[1].count;
+
+    let fountainSerialNumber = 1;
+
+    levels.forEach(lvConfig => {
+        for (let i = 0; i < lvConfig.count; i++) {
+            const level = lvConfig.id;
+            const fountainR = lvConfig.r;
+            
+            let centerX, centerY;
+            let canPlace = false;
+
+            // --- ★追加：配置場所の抽選（最大100回チャレンジ） ---
+            for (let retry = 0; retry < 100; retry++) {
+                // レベル別に中央集中度（spread）を変える
+                // Lv3: 0.4 (中央40%範囲), Lv2: 0.7 (70%範囲), Lv1: 1.0 (全域)
+                const spread = level === 3 ? 0.4 : (level === 2 ? 0.7 : 1.0);
+                
+                centerX = Math.floor(state.GRID_COLS / 2 + (Math.random() - 0.5) * (state.GRID_COLS * spread));
+                centerY = Math.floor(state.GRID_ROWS / 2 + (Math.random() - 0.5) * (state.GRID_ROWS * spread));
+
+                // 範囲外チェック（spread計算で端を超える可能性があるため）
+                if (centerX < 0 || centerX >= state.GRID_COLS || centerY < 0 || centerY >= state.GRID_ROWS) continue;
+
+                // ★重なり防止：その場所が空白（0 または null）かチェック
+                const currentTile = state.worldGrid[centerY][centerX];
+                if (!currentTile || (currentTile < 99000)) {
+                    canPlace = true;
+                    break; 
+                }
+            }
+
+            if (!canPlace) continue; 
+            // ----------------------------------------------
+
+            const fountainID = 99000 + (level * 100) + fountainSerialNumber;
+            fountainSerialNumber++;
+            //‼️
+            state.fountains.push({
+                id: fountainID,
+                x: centerX,  // グリッド座標のX
+                y: centerY,  // グリッド座標のY
+                r: fountainR // 半径
+            }); 
+            //‼️
+
+            for (let dy = -fountainR; dy <= fountainR; dy++) {
+                for (let dx = -fountainR; dx <= fountainR; dx++) {
+                    const gy = centerY + dy;
+                    const gx = centerX + dx;
+
+                    if (gy >= 0 && gy < state.GRID_ROWS && gx >= 0 && gx < state.GRID_COLS) {
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist <= fountainR) {
+                            state.worldGrid[gy][gx] = fountainID;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    rebuildTerritoryRects();
+}
+    //‼️
+    // 鬼モード: 回転歯車（通常 + 超巨大）
+    if (HELL_OBSTACLES) {
+        // 通常歯車 5個
+        for (let i = 0; i < 5; i++) {
+            const radius = 150 + Math.random() * 150;
+            const cx = radius + 100 + Math.random() * (state.WORLD_WIDTH - radius * 2 - 200);
+            const cy = radius + 100 + Math.random() * (state.WORLD_HEIGHT - radius * 2 - 200);
+            const speed = (0.15 + Math.random() * 0.35) * (Math.random() < 0.5 ? 1 : -1);
+            const teeth = Math.floor(3 + Math.random() * 2);
+            const toothWidth = 0.1;
+            state.gears.push({ cx, cy, radius, speed, teeth, toothWidth, angle: Math.random() * Math.PI * 2 });
+        }
+        // 超巨大歯車 2個
+        for (let i = 0; i < 2; i++) {
+            const radius = 400 + Math.random() * 200;  // 半径400〜600px
+            const cx = radius + 50 + Math.random() * (state.WORLD_WIDTH - radius * 2 - 100);
+            const cy = radius + 50 + Math.random() * (state.WORLD_HEIGHT - radius * 2 - 100);
+            const speed = (0.05 + Math.random() * 0.15) * (Math.random() < 0.5 ? 1 : -1);  // 超ゆっくり
+            const teeth = Math.floor(5 + Math.random() * 3);  // 5〜7本（巨大なので歯が多くても隙間広い）
+            const toothWidth = 0.08;
+            state.gears.push({ cx, cy, radius, speed, teeth, toothWidth, angle: Math.random() * Math.PI * 2 });
+        }
+    }
+
+    // 常設: 超巨大歯車1個（マップ中央付近）
+    if (GEAR_ENABLED) {
+        const radius = 500;
+        const cx = state.WORLD_WIDTH / 2 + (Math.random() - 0.5) * 200;
+        const cy = state.WORLD_HEIGHT / 2 + (Math.random() - 0.5) * 200;
+        const speed = 0.1 * (Math.random() < 0.5 ? 1 : -1);
+        const teeth = 5;
+        const toothWidth = 0.1;
+        state.gears.push({ cx, cy, radius, speed, teeth, toothWidth, angle: Math.random() * Math.PI * 2 });
+    }
+
+    // 歯車中心エリア内の障害物を除去（占領可能にするため）
+    state.gears.forEach(g => {
+        const clearR = g.radius * 0.45;  // 中心安全エリア
+        const gridR = Math.ceil(clearR / GRID_SIZE);
+        const gcx = Math.round(g.cx / GRID_SIZE);
+        const gcy = Math.round(g.cy / GRID_SIZE);
+        for (let dy = -gridR; dy <= gridR; dy++) {
+            for (let dx = -gridR; dx <= gridR; dx++) {
+                const gx = gcx + dx;
+                const gy = gcy + dy;
+                if (gy < 0 || gy >= state.GRID_ROWS || gx < 0 || gx >= state.GRID_COLS) continue;
+                const px = gx * GRID_SIZE + GRID_SIZE / 2 - g.cx;
+                const py = gy * GRID_SIZE + GRID_SIZE / 2 - g.cy;
+                if (Math.sqrt(px * px + py * py) < clearR) {
+                    if (state.worldGrid[gy][gx] === 'obstacle') {
+                        state.worldGrid[gy][gx] = null;
+                    }
+                }
+            }
+        }
+        // obstacles配列からも歯車中心と重なるものを除去
+        state.obstacles = state.obstacles.filter(o => {
+            const ox = o.x + o.width / 2;
+            const oy = o.y + o.height / 2;
+            const dist = Math.sqrt((ox - g.cx) ** 2 + (oy - g.cy) ** 2);
+            return dist > clearR;
+        });
+    });
+
+    rebuildTerritoryRects();
+}
+
+// ============================================================
+// テリトリー再構築（差分追跡付き）
+// ============================================================
+function rebuildTerritoryRects() {
+    //‼️
+    const GRID_COLS = state.GRID_COLS;
+    const GRID_ROWS = state.GRID_ROWS;
+    const GRID_SIZE = 10; // お使いのグリッドサイズに合わせてください
+    const worldGrid = state.worldGrid;
+    const newRects = [];
+    const processed = new Uint8Array(GRID_ROWS * GRID_COLS);
+
+    for (let y = 0; y < GRID_ROWS; y++) {
+        const row = worldGrid[y];
+        for (let x = 0; x < GRID_COLS; x++) {
+            const idx = y * GRID_COLS + x;
+            if (processed[idx]) continue;
+
+            const cell = row[x]; // 生のID (例: 123 または 12399001)
+            if (cell && !isObstacleCell(cell)) {
+                
+                // 1. 横方向にどこまで「完全に同じID」が続くかチェック
+                let w = 1;
+                while (x + w < GRID_COLS && !processed[idx + w]) {
+                    const nextCell = row[x + w];
+                    
+                    // ★ここを修正：所有者ではなく「生の値」が一致する場合のみ結合
+                    if (nextCell === cell) {
+                        w++;
+                    } else {
+                        break;
+                    }
+                }
+
+                // 処理済みフラグを立てる
+                for (let k = 0; k < w; k++) processed[idx + k] = 1;
+
+                // 2. 所有者のプレイヤー情報を取得（色の参照用）
+                const realOwnerId = cell >= 100000 ? Math.floor(cell / 100000) : cell;
+                const p = state.players[realOwnerId];
+
+                // 3. 描画データの作成
+                if (cell >= 100000) {
+                    // 合体ID（泉に隣接）だけを白く！
+                    newRects.push({ 
+                        o: cell, 
+                        c: '#ffffff', 
+                        x: x * GRID_SIZE, 
+                        y: y * GRID_SIZE, 
+                        w: w * GRID_SIZE, 
+                        h: GRID_SIZE 
+                    });
+                } else if (cell >= 99000 && cell <= 99999) {
+                    // 泉本体
+                    newRects.push({ o: cell, c: 'rgba(0, 255, 255, 0.5)', x: x * GRID_SIZE, y: y * GRID_SIZE, w: w * GRID_SIZE, h: GRID_SIZE });
+                } else if (p) {
+                    // 通常の陣地（プレイヤーの色）
+                    newRects.push({ o: cell, c: p.color, x: x * GRID_SIZE, y: y * GRID_SIZE, w: w * GRID_SIZE, h: GRID_SIZE });
+                }
+            }
+        }
+    }
+    //‼️
+    // 差分検出（数値キーでMap操作を高速化）
+    const oldMap = new Map();
+    state.territoryRects.forEach(r => oldMap.set(r.y * 100000 + r.x, r));
+    const newMap = new Map();
+    newRects.forEach(r => newMap.set(r.y * 100000 + r.x, r));
+
+    const added = [];
+    newRects.forEach(r => {
+        const old = oldMap.get(r.y * 100000 + r.x);
+        if (!old || old.o !== r.o || old.w !== r.w) added.push(r);
+    });
+
+    const removed = [];
+    state.territoryRects.forEach(r => {
+        const newRect = newMap.get(r.y * 100000 + r.x);
+        if (!newRect || newRect.o !== r.o || newRect.w !== r.w) removed.push({ x: r.x, y: r.y });
+    });
+
+    if (added.length > 0 || removed.length > 0) {
+        state.territoryVersion++;
+        state.pendingTerritoryUpdates.push({ v: state.territoryVersion, a: added, r: removed });
+        if (state.pendingTerritoryUpdates.length > 10) state.pendingTerritoryUpdates.shift();
+        state.territoriesChanged = true;
+    }
+    state.territoryRects = newRects;
+}
+
+// ============================================================
+// Broadcast (msgpack経由)
+// ============================================================
+let msgpack = null;
+function setMsgpack(mp) { msgpack = mp; }
+
+function broadcast(msg) {
+    if (!wss || !msgpack) return;
+    const payload = msgpack.encode(msg);
+    const byteLen = payload.length;
+    let sentCount = 0;
+    wss.clients.forEach(c => {
+        if (c.readyState === WebSocket.OPEN) { c.send(payload); sentCount++; }
+    });
+    bandwidthStats.totalBytesSent += byteLen * sentCount;
+    bandwidthStats.periodBytesSent += byteLen * sentCount;
+    bandwidthStats.msgsSent += sentCount;
+    bandwidthStats.periodMsgsSent += sentCount;
+}
+
+// ============================================================
+// チーム統計
+// ============================================================
+function getTeamStats() {
+    const counts = { '🍂たぬき': 0 };   // 「🍂たぬき」は常に表示
+    Object.values(state.players).forEach(p => {
+        const t = p.requestedTeam || p.team;
+        if (t) counts[t] = (counts[t] || 0) + 1;
+    });
+    return Object.keys(counts).sort((a, b) => counts[b] - counts[a]).map(name => ({ name, count: counts[name] }));
+}
+
+// ============================================================
+// ミニマップ生成
+// ============================================================
+function generateMinimapBitmap() {
+    const scale = state.WORLD_WIDTH / MINIMAP_SIZE;
+    const gridScale = scale / GRID_SIZE;
+    const palette = {}; const colors = {}; let colorIdx = 1;
+
+    Object.values(state.players).forEach(p => {
+        if (p.state !== 'waiting' && !palette[p.id]) {
+            palette[p.id] = colorIdx; colors[colorIdx] = p.color; colorIdx++;
+            if (colorIdx > 255) colorIdx = 255;
+        }
+    });
+
+    const bitmap = new Uint8Array(MINIMAP_SIZE * MINIMAP_SIZE);
+    const usedColors = new Set();
+
+    for (let my = 0; my < MINIMAP_SIZE; my++) {
+        for (let mx = 0; mx < MINIMAP_SIZE; mx++) {
+            const gx = Math.floor((mx + 0.5) * gridScale);
+            const gy = Math.floor((my + 0.5) * gridScale);
+            if (gy >= 0 && gy < state.GRID_ROWS && gx >= 0 && gx < state.GRID_COLS) {
+                const owner = state.worldGrid[gy][gx];
+                if (owner && !isObstacleCell(owner) && palette[owner]) {
+                    bitmap[my * MINIMAP_SIZE + mx] = palette[owner];
+                    usedColors.add(palette[owner]);
+                }
+            }
+        }
+    }
+
+    const usedPalette = {};
+    usedColors.forEach(idx => { usedPalette[idx] = colors[idx]; });
+    const compressed = zlib.deflateSync(Buffer.from(bitmap), { level: 1 });
+    
+    // チーム戦モード時: 国旗位置を計算（Union-Findクラスタリング）
+    const flags = [];
+    const mode = GAME_MODES[state.currentModeIdx];
+    if (mode === 'TEAM') {
+        const teamRectLists = {};
+        state.territoryRects.forEach(t => {
+            const owner = state.players[t.o];
+            if (owner && owner.team) {
+                if (!teamRectLists[owner.team]) {
+                    teamRectLists[owner.team] = [];
+                }
+                teamRectLists[owner.team].push(t);
+            }
+        });
+
+        const minClusterArea = (state.WORLD_WIDTH * state.WORLD_HEIGHT) * 0.02;
+
+        Object.entries(teamRectLists).forEach(([teamName, rectList]) => {
+            const chars = Array.from(teamName);
+            if (chars.length < 2) return;
+            const first = chars[0].codePointAt(0);
+            const second = chars[1].codePointAt(0);
+            if (first < 0x1F1E6 || first > 0x1F1FF || second < 0x1F1E6 || second > 0x1F1FF) return;
+            const flag = chars[0] + chars[1];
+
+            const clusters = clusterRectsUnionFind(rectList, 100);
+            clusters.forEach(cluster => {
+                if (cluster.totalArea < minClusterArea) return;
+                flags.push({ f: flag, x: cluster.centerX, y: cluster.centerY });
+            });
+        });
+    }
+    
+    return { bm: compressed, cp: usedPalette, sz: MINIMAP_SIZE, flags: flags };
+}
+
+// ============================================================
+// killPlayer参照（server.jsから設定される）
+// ============================================================
+let killPlayerFn = null;
+function setKillPlayer(fn) { killPlayerFn = fn; }
+
+// ============================================================
+// attemptCapture - 完全版フロードフィルロジック
+// ============================================================
+function attemptCapture(playerId) {
+    const p = state.players[playerId];
+    if (!p) return;
+
+    const GRID_COLS = state.GRID_COLS;
+    const GRID_ROWS = state.GRID_ROWS;
+    const totalCells = GRID_COLS * GRID_ROWS;
+    const worldGrid = state.worldGrid;
+    const players = state.players;
+
+    // 1. Build Base Grid Mask (Existing Territory + Teammates)
+    const baseGrid = new Uint8Array(totalCells);
+    for (let y = 0; y < GRID_ROWS; y++) {
+        const row = worldGrid[y];
+        const yOff = y * GRID_COLS;
+        for (let x = 0; x < GRID_COLS; x++) {
+            const ownerId = row[x];
+            //‼️
+            // --- ★ここを修正：合体IDから元のplayerIdを取り出して判定 ---
+            const realOwnerId = ownerId >= 100000 ? Math.floor(ownerId / 100000) : ownerId;
+            //‼️
+            if (realOwnerId === playerId) {//‼️
+                baseGrid[yOff + x] = 1;
+            } else if (isObstacleCell(ownerId)) {
+                baseGrid[yOff + x] = 1;
+            }//‼️
+            // --- ★修正：5桁の泉ID（99000〜99999）をすべて境界線として扱う ---
+            else if (ownerId >= 99000 && ownerId <= 99999) {
+                baseGrid[yOff + x] = 1; // どのレベルのどの泉も、塗りつぶしをブロック！
+            }
+            // --- ★修正：991〜999（泉レベル1〜3）も境界線として扱う ---
+            //else if (ownerId >= 991 && ownerId <= 999) {
+              //  baseGrid[yOff + x] = 1; // 泉は塗りつぶせない「壁」と同じ扱いにする
+            //} 
+            //else if (ownerId === 99) { // ★ ここを追加！
+                //baseGrid[yOff + x] = 1; // 泉も「壁（塗りつぶせない境界線）」として扱う
+            //}//‼️ 
+            else if (p.team && ownerId) {
+                const realOwnerId = ownerId >= 100000 ? Math.floor(ownerId / 100000) : ownerId;//‼️
+                const owner = players[realOwnerId];//‼️
+                if (owner && owner.team === p.team) {
+                    baseGrid[yOff + x] = 1;
+                }
+            }
+        }
+    }
+
+    // トレイルセルを収集
+    const trailSet = new Uint8Array(totalCells);
+    p.gridTrail.forEach(pt => {
+        if (pt.x >= 0 && pt.x < GRID_COLS && pt.y >= 0 && pt.y < GRID_ROWS) {
+            trailSet[pt.y * GRID_COLS + pt.x] = 1;
+        }
+    });
+
+    // 統合BFS: baseGrid + trailを壁としたBFSを1回実行
+    // trail無しのBFS結果は「baseGridのみを壁とした外部到達性」
+    // trail有りのBFS結果は「baseGrid+trailを壁とした外部到達性」
+    // 差分 = trailで新たに囲まれた領域
+    // 最適化: trailを壁に含めたBFSを実行し、追加でtrailを壁に含めないBFSも実行
+    // → 2回のBFSは避けられないが、baseGridの構築は1回で済む
+
+    // BFS with trail as walls (visitedCur)
+    const visitedCur = new Uint8Array(totalCells);
+    const queue = [];
+    let head = 0;
+
+    const tryPushCur = (idx) => {
+        if (baseGrid[idx] !== 1 && trailSet[idx] !== 1 && visitedCur[idx] === 0) {
+            visitedCur[idx] = 1;
+            queue.push(idx);
+        }
+    };
+
+    for (let x = 0; x < GRID_COLS; x++) { tryPushCur(x); tryPushCur((GRID_ROWS - 1) * GRID_COLS + x); }
+    for (let y = 1; y < GRID_ROWS - 1; y++) { tryPushCur(y * GRID_COLS); tryPushCur(y * GRID_COLS + GRID_COLS - 1); }
+
+    while (head < queue.length) {
+        const idx = queue[head++];
+        const cx = idx % GRID_COLS;
+        const cy = (idx - cx) / GRID_COLS;
+        if (cx > 0) tryPushCur(idx - 1);
+        if (cx < GRID_COLS - 1) tryPushCur(idx + 1);
+        if (cy > 0) tryPushCur(idx - GRID_COLS);
+        if (cy < GRID_ROWS - 1) tryPushCur(idx + GRID_COLS);
+    }
+
+    // BFS without trail (visitedPre) - baseGridのみを壁として
+    const visitedPre = new Uint8Array(totalCells);
+    const queue2 = [];
+    head = 0;
+
+    const tryPushPre = (idx) => {
+        if (baseGrid[idx] !== 1 && visitedPre[idx] === 0) {
+            visitedPre[idx] = 1;
+            queue2.push(idx);
+        }
+    };
+
+    for (let x = 0; x < GRID_COLS; x++) { tryPushPre(x); tryPushPre((GRID_ROWS - 1) * GRID_COLS + x); }
+    for (let y = 1; y < GRID_ROWS - 1; y++) { tryPushPre(y * GRID_COLS); tryPushPre(y * GRID_COLS + GRID_COLS - 1); }
+
+    while (head < queue2.length) {
+        const idx = queue2[head++];
+        const cx = idx % GRID_COLS;
+        const cy = (idx - cx) / GRID_COLS;
+        if (cx > 0) tryPushPre(idx - 1);
+        if (cx < GRID_COLS - 1) tryPushPre(idx + 1);
+        if (cy > 0) tryPushPre(idx - GRID_COLS);
+        if (cy < GRID_ROWS - 1) tryPushPre(idx + GRID_COLS);
+    }
+
+    // trailSetは既にUint8Arrayで構築済み
+    const trailCells = trailSet;  // BFS統合時に構築済みのUint8Arrayを再利用
+    const enemyTrailCells = [];
+    const blankTrailCells = [];
+
+    p.gridTrail.forEach(pt => {
+        if (pt.x >= 0 && pt.x < GRID_COLS && pt.y >= 0 && pt.y < GRID_ROWS) {
+            const owner = worldGrid[pt.y][pt.x];
+            if (owner && owner !== playerId && !isObstacleCell(owner)) {
+                if (p.team) {
+                    const ownerPlayer = players[owner];
+                    if (ownerPlayer && ownerPlayer.team === p.team) return;
+                }
+                enemyTrailCells.push({ x: pt.x, y: pt.y, owner });
+            } else if (!owner) {
+                blankTrailCells.push({ x: pt.x, y: pt.y });
+            }
+        }
+    });
+
+    // 敵陣地Island計算（Uint8Array + index-based BFS）
+    const enemyCaptureZone = new Uint8Array(totalCells);
+    const processedEnemyCells = new Uint8Array(totalCells);
+    const islands = [];
+
+    const nbDirs = [-1, 1, -GRID_COLS, GRID_COLS];
+
+    enemyTrailCells.forEach(startCell => {
+        const nbOffsets = [
+            startCell.y * GRID_COLS + startCell.x - 1,
+            startCell.y * GRID_COLS + startCell.x + 1,
+            (startCell.y - 1) * GRID_COLS + startCell.x,
+            (startCell.y + 1) * GRID_COLS + startCell.x
+        ];
+        const nbCoords = [
+            { x: startCell.x - 1, y: startCell.y },
+            { x: startCell.x + 1, y: startCell.y },
+            { x: startCell.x, y: startCell.y - 1 },
+            { x: startCell.x, y: startCell.y + 1 }
+        ];
+        for (let ni = 0; ni < 4; ni++) {
+            const nb = nbCoords[ni];
+            if (nb.x < 0 || nb.x >= GRID_COLS || nb.y < 0 || nb.y >= GRID_ROWS) continue;
+            const nbIdx = nbOffsets[ni];
+            const cellOwner = worldGrid[nb.y][nb.x];
+            if (!processedEnemyCells[nbIdx] && visitedCur[nbIdx] === 0 && cellOwner === startCell.owner && !trailCells[nbIdx]) {
+                const islandCells = [];
+                const bfsQueue = [nbIdx];
+                let bfsHead = 0;
+                processedEnemyCells[nbIdx] = 1;
+                islandCells.push(nbIdx);
+                while (bfsHead < bfsQueue.length) {
+                    const curIdx = bfsQueue[bfsHead++];
+                    const cx = curIdx % GRID_COLS;
+                    const cy = (curIdx - cx) / GRID_COLS;
+                    for (let d = 0; d < 4; d++) {
+                        const nIdx = curIdx + nbDirs[d];
+                        const nx = cx + (d === 0 ? -1 : d === 1 ? 1 : 0);
+                        const ny = cy + (d === 2 ? -1 : d === 3 ? 1 : 0);
+                        if (nx < 0 || nx >= GRID_COLS || ny < 0 || ny >= GRID_ROWS) continue;
+                        if (!processedEnemyCells[nIdx]) {
+                            const nOwner = worldGrid[ny][nx];
+                            if (visitedCur[nIdx] === 0 && nOwner === startCell.owner && !trailCells[nIdx]) {
+                                processedEnemyCells[nIdx] = 1;
+                                islandCells.push(nIdx);
+                                bfsQueue.push(nIdx);
+                            }
+                        }
+                    }
+                }
+                if (islandCells.length > 0) islands.push({ owner: startCell.owner, cells: islandCells, size: islandCells.length });
+            }
+        }
+    });
+
+    const islandsByOwner = {};
+    islands.forEach(island => {
+        if (!islandsByOwner[island.owner]) islandsByOwner[island.owner] = [];
+        islandsByOwner[island.owner].push(island);
+    });
+
+    Object.values(islandsByOwner).forEach(ownerIslands => {
+        if (ownerIslands.length > 1) {
+            ownerIslands.sort((a, b) => b.size - a.size);
+            const maxSize = ownerIslands[0].size;
+            // 最大島が狭い（幅or高さ5グリッド以下）なら全島奪取
+            let largestIsNarrow = false;
+            if (maxSize > 10) {
+                let minX = GRID_COLS, maxX = 0, minY = GRID_ROWS, maxY = 0;
+                ownerIslands[0].cells.forEach(idx => {
+                    const cx = idx % GRID_COLS;
+                    const cy = (idx - cx) / GRID_COLS;
+                    if (cx < minX) minX = cx;
+                    if (cx > maxX) maxX = cx;
+                    if (cy < minY) minY = cy;
+                    if (cy > maxY) maxY = cy;
+                });
+                if (maxX - minX + 1 <= 5 || maxY - minY + 1 <= 5) largestIsNarrow = true;
+            }
+            if (maxSize <= 10 || largestIsNarrow) {
+                ownerIslands.forEach(island => island.cells.forEach(idx => { enemyCaptureZone[idx] = 1; }));
+            } else {
+                for (let i = 1; i < ownerIslands.length; i++) {
+                    ownerIslands[i].cells.forEach(idx => { enemyCaptureZone[idx] = 1; });
+                }
+            }
+        }
+    });
+
+    // 空白Island計算（Uint8Array + index-based BFS）
+    const blankCaptureZone = new Uint8Array(totalCells);
+    const processedBlankCells = new Uint8Array(totalCells);
+    const blankIslands = [];
+
+    blankTrailCells.forEach(startCell => {
+        const nbOffsets = [
+            startCell.y * GRID_COLS + startCell.x - 1,
+            startCell.y * GRID_COLS + startCell.x + 1,
+            (startCell.y - 1) * GRID_COLS + startCell.x,
+            (startCell.y + 1) * GRID_COLS + startCell.x
+        ];
+        const nbCoords = [
+            { x: startCell.x - 1, y: startCell.y },
+            { x: startCell.x + 1, y: startCell.y },
+            { x: startCell.x, y: startCell.y - 1 },
+            { x: startCell.x, y: startCell.y + 1 }
+        ];
+        for (let ni = 0; ni < 4; ni++) {
+            const nb = nbCoords[ni];
+            if (nb.x < 0 || nb.x >= GRID_COLS || nb.y < 0 || nb.y >= GRID_ROWS) continue;
+            const nbIdx = nbOffsets[ni];
+            const cellOwner = worldGrid[nb.y][nb.x];
+            if (!processedBlankCells[nbIdx] && visitedCur[nbIdx] === 0 && !cellOwner && !trailCells[nbIdx]) {
+                const islandCells = [];
+                const bfsQueue = [nbIdx];
+                let bfsHead = 0;
+                processedBlankCells[nbIdx] = 1;
+                islandCells.push(nbIdx);
+                while (bfsHead < bfsQueue.length) {
+                    const curIdx = bfsQueue[bfsHead++];
+                    const cx = curIdx % GRID_COLS;
+                    const cy = (curIdx - cx) / GRID_COLS;
+                    for (let d = 0; d < 4; d++) {
+                        const nIdx = curIdx + nbDirs[d];
+                        const nx = cx + (d === 0 ? -1 : d === 1 ? 1 : 0);
+                        const ny = cy + (d === 2 ? -1 : d === 3 ? 1 : 0);
+                        if (nx < 0 || nx >= GRID_COLS || ny < 0 || ny >= GRID_ROWS) continue;
+                        if (!processedBlankCells[nIdx]) {
+                            const nOwner = worldGrid[ny][nx];
+                            if (visitedCur[nIdx] === 0 && !nOwner && !trailCells[nIdx]) {
+                                processedBlankCells[nIdx] = 1;
+                                islandCells.push(nIdx);
+                                bfsQueue.push(nIdx);
+                            }
+                        }
+                    }
+                }
+                if (islandCells.length > 0) blankIslands.push({ cells: islandCells, size: islandCells.length });
+            }
+        }
+    });
+
+    if (blankIslands.length > 1) {
+        blankIslands.sort((a, b) => b.size - a.size);
+        const maxSize = blankIslands[0].size;
+        // 最大島が狭い（幅or高さ5グリッド以下）なら全島奪取
+        let largestIsNarrow = false;
+        if (maxSize > 10) {
+            let minX = GRID_COLS, maxX = 0, minY = GRID_ROWS, maxY = 0;
+            blankIslands[0].cells.forEach(idx => {
+                const cx = idx % GRID_COLS;
+                const cy = (idx - cx) / GRID_COLS;
+                if (cx < minX) minX = cx;
+                if (cx > maxX) maxX = cx;
+                if (cy < minY) minY = cy;
+                if (cy > maxY) maxY = cy;
+            });
+            if (maxX - minX + 1 <= 5 || maxY - minY + 1 <= 5) largestIsNarrow = true;
+        }
+        if (maxSize <= 10 || largestIsNarrow) {
+            blankIslands.forEach(island => island.cells.forEach(idx => { blankCaptureZone[idx] = 1; }));
+        } else {
+            for (let i = 1; i < blankIslands.length; i++) {
+                blankIslands[i].cells.forEach(idx => { blankCaptureZone[idx] = 1; });
+            }
+        }
+    }
+
+    // Capture Step（改善: 早期スキップ + キル検出Map化 + rebuild統合）
+    let capturedCount = 0;
+    let kills = [];
+
+    // キル検出用: プレイヤー位置をMapに事前構築（O(1)ルックアップ）
+    const playerGridMap = new Map();
+    Object.values(players).forEach(target => {
+        if (target.id !== playerId && target.state === 'active') {
+            if (p.team && target.team === p.team) return;
+            const key = toGrid(target.x) * 100000 + toGrid(target.y);
+            if (!playerGridMap.has(key)) playerGridMap.set(key, []);
+            playerGridMap.get(key).push(target.id);
+        }
+    });
+
+    for (let y = 0; y < GRID_ROWS; y++) {
+        for (let x = 0; x < GRID_COLS; x++) {
+            const idx = y * GRID_COLS + x;
+            // 早期スキップ: 自陣/障害物/味方はキャプチャ不要
+            if (baseGrid[idx] === 1) continue;
+            // 早期スキップ: 外部到達可能セル（トレイル壁あり）はキャプチャ不要
+            if (visitedCur[idx] === 1) continue;
+
+            const oldOwner = worldGrid[y][x];
+            //‼️
+            // --- ★修正：5桁の泉ID（99000〜99999）をすべて保護対象にする ---
+            if (oldOwner >= 99000 && oldOwner <= 99999) continue;
+            //‼️
+            if (isObstacleCell(oldOwner)) continue;
+
+            const isNewlyEnclosed = visitedPre[idx] === 1;
+            const isEnemyCapturable = enemyCaptureZone[idx] === 1;
+            const isBlankCapturable = blankCaptureZone[idx] === 1;
+
+            if (isNewlyEnclosed || isEnemyCapturable || isBlankCapturable) {
+                let isTeammate = false;
+                if (p.team && oldOwner) {
+                    const op = players[oldOwner];
+                    if (op && op.team === p.team) isTeammate = true;
+                }
+
+                if (oldOwner !== playerId && !isTeammate) {
+                    if (oldOwner && players[oldOwner]) {
+                        players[oldOwner].score = Math.max(0, (players[oldOwner].score || 0) - 1);
+                    }
+                    //‼️
+                    // --- ★追加：隣接する泉を探して特殊IDを作る ---
+                    let finalIdToSet = playerId;
+
+                    // 上下左右の4方向を調べる
+                    const nx = [x, x, x - 1, x + 1];
+                    const ny = [y - 1, y + 1, y, y];
+
+                    for (let n = 0; n < 4; n++) {
+                        const gx = nx[n];
+                        const gy = ny[n];
+
+                        if (gy >= 0 && gy < GRID_ROWS && gx >= 0 && gx < GRID_COLS) {
+                            const neighbor = worldGrid[gy][gx];
+                            // 隣が「泉(99000〜99999)」なら合体IDを作成
+                            if (neighbor >= 99000 && neighbor <= 99999) {
+                                finalIdToSet = (playerId * 100000) + neighbor;
+                                break; // 1つ見つかればOK
+                            }
+                        }
+                    }
+
+                    worldGrid[y][x] = finalIdToSet;
+                    //‼️
+                    //worldGrid[y][x] = playerId;
+                    capturedCount++;
+
+                    // Map O(1)ルックアップでキル判定
+                    const hitPlayers = playerGridMap.get(x * 100000 + y);
+                    if (hitPlayers) kills.push(...hitPlayers);
+                }
+            }
+        }
+    }
+
+    if (capturedCount > 0) {
+        p.score += capturedCount;
+
+        if (kills.length > 0 && killPlayerFn) {
+            // キル処理
+            kills.forEach(kid => {
+                killPlayerFn(kid, `${p.name}に囲まれた`, true);
+                p.kills = (p.kills || 0) + 1;
+            });
+            // 倒した相手の残り陣地を一括奪取（worldGrid直接スキャン）
+            //‼️
+            const killSet = new Set(kills);
+            let totalStolen = 0;
+            for (let sy = 0; sy < GRID_ROWS; sy++) {
+                const row = worldGrid[sy];
+                for (let sx = 0; sx < GRID_COLS; sx++) {
+                    const cellValue = row[sx];
+                    if (cellValue === 0) continue;
+
+                    // 1. そのマスの「真の持ち主」を判定
+                    const cellOwner = cellValue >= 100000 ? Math.floor(cellValue / 100000) : cellValue;
+
+                    // 2. 倒した相手の陣地だったら奪う
+                    if (killSet.has(cellOwner)) {
+                        if (cellValue >= 100000) {
+                            // ★ 合体IDだった場合：プレイヤー部分だけ自分にすり替えて、泉ID(下5桁)は維持！
+                            const fountainPart = cellValue % 100000;
+                            row[sx] = (playerId * 100000) + fountainPart;
+                        } else {
+                            // 普通のマスだった場合：そのまま自分のIDにする
+                            row[sx] = playerId;
+                        }
+                        totalStolen++;
+                    }
+                }
+            }//‼️
+            if (totalStolen > 0) p.score += totalStolen;
+        }
+        rebuildTerritoryRects();  // 1回だけ呼び出し（従来は最大4回）
+    }
+
+    p.gridTrail = [];
+    p.trail = [];
+}
+
+// ============================================================
+// スコア画面用の国旗位置計算
+// ============================================================
+function calculateMapFlags() {
+    const flags = [];
+    const mode = GAME_MODES[state.currentModeIdx];
+
+    if (mode !== 'TEAM') return flags;
+
+    const teamRectLists = {};
+    state.territoryRects.forEach(t => {
+        const owner = state.players[t.o];
+        if (owner && owner.team) {
+            if (!teamRectLists[owner.team]) {
+                teamRectLists[owner.team] = [];
+            }
+            teamRectLists[owner.team].push(t);
+        }
+    });
+
+    const minClusterArea = (state.WORLD_WIDTH * state.WORLD_HEIGHT) * 0.015;
+
+    Object.entries(teamRectLists).forEach(([teamName, rectList]) => {
+        const chars = Array.from(teamName);
+        if (chars.length < 2) return;
+        const first = chars[0].codePointAt(0);
+        const second = chars[1].codePointAt(0);
+        if (first < 0x1F1E6 || first > 0x1F1FF || second < 0x1F1E6 || second > 0x1F1FF) return;
+        const flag = chars[0] + chars[1];
+
+        const clusters = clusterRectsUnionFind(rectList, 100);
+        clusters.forEach(cluster => {
+            if (cluster.totalArea < minClusterArea) return;
+            flags.push({ f: flag, x: cluster.centerX, y: cluster.centerY });
+        });
+    });
+
+    return flags;
+}
+
+// ============================================================
+// DB保存関数
+// ============================================================
+async function saveRankingsToDB(mode, rankings, teamRankings, playerCount) {
+    if (!dbPool) return;
+    try {
+        const conn = await dbPool.getConnection();
+        const [roundResult] = await conn.execute(
+            'INSERT INTO rounds (mode, played_at, player_count) VALUES (?, ?, ?)',
+            [mode, new Date(), playerCount]
+        );
+        const roundId = roundResult.insertId;
+
+        for (let i = 0; i < rankings.length; i++) {
+            const r = rankings[i];
+            await conn.execute(
+                'INSERT INTO player_rankings (round_id, rank_position, player_name, team, emoji, score, kills) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [roundId, i + 1, r.name || 'Unknown', r.team || '', r.emoji || '', r.score || 0, r.kills || 0]
+            );
+        }
+
+        for (let i = 0; i < teamRankings.length; i++) {
+            const t = teamRankings[i];
+            await conn.execute(
+                'INSERT INTO team_rankings (round_id, rank_position, team_name, score, kills) VALUES (?, ?, ?, ?, ?)',
+                [roundId, i + 1, t.name, t.score || 0, t.kills || 0]
+            );
+        }
+
+        await saveRoundMinimap(conn, roundId);
+        conn.release();
+        console.log(`[DB] Saved round #${roundId}`);
+        // キャッシュ再構築（非同期・ノンブロッキング）
+        rebuildWinsCache();
+    } catch (e) {
+        console.error('[DB] Failed to save rankings:', e.message);
+    }
+}
+
+async function rebuildWinsCache() {
+    if (!dbPool) return;
+    let conn;
+    try {
+        conn = await dbPool.getConnection();
+
+        // トランザクションで一括更新（DELETE中に空データを返さない）
+        await conn.beginTransaction();
+
+        // 時間杯キャッシュ再構築（直近48時間分）
+        await conn.query('DELETE FROM wins_hourly_cache');
+        await conn.query(`
+            INSERT INTO wins_hourly_cache (type, hour_slot, hour_num, name, wins)
+            SELECT 'team', DATE_FORMAT(r.played_at, '%Y-%m-%d %H:00:00'), HOUR(r.played_at), tr.team_name, COUNT(*)
+            FROM team_rankings tr
+            JOIN rounds r ON tr.round_id = r.id
+            WHERE tr.rank_position = 1
+              AND r.mode = 'TEAM'
+              AND r.played_at >= DATE_SUB(NOW(), INTERVAL 48 HOUR)
+            GROUP BY DATE_FORMAT(r.played_at, '%Y-%m-%d %H:00:00'), HOUR(r.played_at), tr.team_name
+        `);
+        await conn.query(`
+            INSERT INTO wins_hourly_cache (type, hour_slot, hour_num, name, wins)
+            SELECT 'player', DATE_FORMAT(r.played_at, '%Y-%m-%d %H:00:00'), HOUR(r.played_at), pr.player_name, COUNT(*)
+            FROM player_rankings pr
+            JOIN rounds r ON pr.round_id = r.id
+            WHERE pr.rank_position = 1
+              AND r.played_at >= DATE_SUB(NOW(), INTERVAL 48 HOUR)
+            GROUP BY DATE_FORMAT(r.played_at, '%Y-%m-%d %H:00:00'), HOUR(r.played_at), pr.player_name
+        `);
+
+        // 1日杯キャッシュ再構築（直近30日分）
+        await conn.query('DELETE FROM wins_daily_cache');
+        await conn.query(`
+            INSERT INTO wins_daily_cache (type, day_slot, day_label, name, wins)
+            SELECT 'team', DATE(r.played_at), DATE_FORMAT(r.played_at, '%m/%d'), tr.team_name, COUNT(*)
+            FROM team_rankings tr
+            JOIN rounds r ON tr.round_id = r.id
+            WHERE tr.rank_position = 1
+              AND r.mode = 'TEAM'
+              AND r.played_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+            GROUP BY DATE(r.played_at), DATE_FORMAT(r.played_at, '%m/%d'), tr.team_name
+        `);
+        await conn.query(`
+            INSERT INTO wins_daily_cache (type, day_slot, day_label, name, wins)
+            SELECT 'player', DATE(r.played_at), DATE_FORMAT(r.played_at, '%m/%d'), pr.player_name, COUNT(*)
+            FROM player_rankings pr
+            JOIN rounds r ON pr.round_id = r.id
+            WHERE pr.rank_position = 1
+              AND r.played_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+            GROUP BY DATE(r.played_at), DATE_FORMAT(r.played_at, '%m/%d'), pr.player_name
+        `);
+
+        await conn.commit();
+        console.log('[DB] Wins cache rebuilt (hourly 48h + daily 30d)');
+    } catch (e) {
+        console.error('[DB] Failed to rebuild wins cache:', e.message);
+        if (conn) try { await conn.rollback(); } catch (_) {}
+    } finally {
+        if (conn) conn.release();
+    }
+}
+
+async function saveRoundMinimap(conn, roundId) {
+    try {
+        const bm = generateMinimapBitmap();
+        const dataToSave = { bm: bm.bm.toString('base64'), cp: bm.cp, sz: bm.sz };
+        await conn.execute('INSERT INTO round_minimaps (round_id, minimap_data) VALUES (?, ?)', [roundId, JSON.stringify(dataToSave)]);
+    } catch (e) {
+        console.error('[DB] Minimap save error:', e.message);
+    }
+}
+
+async function initDB() {
+    if (!dbPool) return;
+    try {
+        const conn = await dbPool.getConnection();
+        
+        // ミニマップテーブル
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS round_minimaps (
+                round_id INT PRIMARY KEY,
+                minimap_data MEDIUMBLOB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
+            )
+        `);
+        
+        // AFKタイムアウト記録テーブル
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS afk_timeouts (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                ip_address VARCHAR(45) NOT NULL,
+                cf_country VARCHAR(5) DEFAULT NULL,
+                cf_ray VARCHAR(50) DEFAULT NULL,
+                timeout_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_ip (ip_address),
+                INDEX idx_timeout (timeout_at),
+                INDEX idx_country (cf_country)
+            )
+        `);
+
+        // 時間杯キャッシュテーブル
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS wins_hourly_cache (
+                type ENUM('team', 'player') NOT NULL,
+                hour_slot DATETIME NOT NULL,
+                hour_num TINYINT NOT NULL,
+                name VARCHAR(50) NOT NULL,
+                wins INT NOT NULL DEFAULT 0,
+                PRIMARY KEY (type, hour_slot, name),
+                INDEX idx_hour_slot (hour_slot)
+            )
+        `);
+
+        // 1日杯キャッシュテーブル
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS wins_daily_cache (
+                type ENUM('team', 'player') NOT NULL,
+                day_slot DATE NOT NULL,
+                day_label VARCHAR(10) NOT NULL,
+                name VARCHAR(50) NOT NULL,
+                wins INT NOT NULL DEFAULT 0,
+                PRIMARY KEY (type, day_slot, name),
+                INDEX idx_day_slot (day_slot)
+            )
+        `);
+
+        conn.release();
+        console.log('[DB] Tables initialized (minimaps, afk_timeouts, wins_cache)');
+        // 起動時にキャッシュ初期構築
+        rebuildWinsCache();
+    } catch (e) {
+        console.error('[DB] Init error:', e);
+    }
+}
+
+// ============================================================
+// exports
+// ============================================================
+module.exports = {
+    // 設定用
+    setWss, setMsgpack, setKillPlayer,
+    // ヘルパー
+    generateId, getUniqueColor, getTeamColor, getRandomEmoji, toGrid, getDistSq, formatBytes, formatTime, generateShortId,
+    // ゲームロジック
+    initGrid, rebuildTerritoryRects, broadcast, getTeamStats, generateMinimapBitmap, calculateMapFlags, attemptCapture,
+    // DB
+    saveRankingsToDB, initDB, rebuildWinsCache,
+    // 定数参照
+    serverStartTime
+};

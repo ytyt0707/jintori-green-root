@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <link href="https://fonts.googleapis.com/css2?family=Yomogi&display=swap" rel="stylesheet">
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>onj-Jintori(新鯖)</title>
+    <link rel="stylesheet" href="style.css?v=2603041607">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/msgpack-lite@0.1.26/dist/msgpack.min.js"></script>
+</head>
+
+<body>
+    <div id="game-container">
+        <canvas id="gameCanvas"></canvas>
+
+        <!-- Login Modal -->
+        <div id="login-modal" class="modal">
+            <div class="modal-box">
+                <div class="modal-title">Haou/☯︎-Jintori<font size=1>(新鯖)</font> <span id="login-pcount"
+                        style="font-size:1rem; font-weight:normal; color:#cbd5e1; margin-left:10px;"></span></div>
+                <div id="login-players"
+                    style="display:flex; flex-wrap:wrap; gap:5px; justify-content:center; margin-bottom:15px; min-height:30px;">
+                </div>
+                <div id="login-hourly-graph"
+                    style="display:none; margin-bottom:12px; padding:8px 10px; background:rgba(0,0,0,0.3); border-radius:8px; border:1px solid #334155;">
+                    <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:4px;">
+                        <button id="login-cup-hourly" class="hourly-tab-btn active"
+                            onclick="switchCupPeriod('login','hourly')">🏆 時間杯</button>
+                        <button id="login-cup-daily" class="hourly-tab-btn"
+                            onclick="switchCupPeriod('login','daily')">📅 1日杯</button>
+                    </div>
+                    <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:6px;">
+                        <button id="login-hourly-tab-team" class="hourly-tab-btn active"
+                            onclick="switchHourlyTab('login', 'team')">チーム</button>
+                        <button id="login-hourly-tab-player" class="hourly-tab-btn"
+                            onclick="switchHourlyTab('login', 'player')">個人</button>
+                    </div>
+                    <div id="login-hourly-bars"></div>
+                    <div id="login-cup-expand"
+                        style="text-align:center; margin:-1px 0 -4px; display:none; line-height:1;">
+                        <i class="fas fa-angles-down" id="login-cup-expand-icon" onclick="toggleCupExpand('login')"
+                            style="color:#cbd5e1; cursor:pointer; font-size:8px; opacity:0.7;"
+                            onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.7'"></i>
+                    </div>
+                </div>
+                <input type="text" id="username-input" class="login-input" placeholder="名前を入力 (任意)" maxlength="8">
+                <div style="display:flex; gap:5px; margin-top:10px; align-items:center;">
+                    <select id="flag-select" class="login-input"
+                        style="width:70px; padding:8px 4px; font-size:1.2rem; cursor:pointer;">
+                        <option value="">🏳️ なし</option>
+                        <option value="🇯🇵">🇯🇵 日本</option>
+                        <option value="🇺🇸">🇺🇸 アメリカ</option>
+                        <option value="🇬🇧">🇬🇧 イギリス</option>
+                        <option value="🇰🇷">🇰🇷 韓国</option>
+                        <option value="🇨🇳">🇨🇳 中国</option>
+                        <option value="🇹🇼">🇹🇼 台湾</option>
+                        <option value="🇩🇪">🇩🇪 ドイツ</option>
+                        <option value="🇫🇷">🇫🇷 フランス</option>
+                        <option value="🇮🇹">🇮🇹 イタリア</option>
+                        <option value="🇪🇸">🇪🇸 スペイン</option>
+                        <option value="🇧🇷">🇧🇷 ブラジル</option>
+                        <option value="🇷🇺">🇷🇺 ロシア</option>
+                        <option value="🇺🇦">🇺🇦 ウクライナ</option>
+                        <option value="🇮🇳">🇮🇳 インド</option>
+                        <option value="🇦🇺">🇦🇺 オーストラリア</option>
+                        <option value="🇨🇦">🇨🇦 カナダ</option>
+                        <option value="🇲🇽">🇲🇽 メキシコ</option>
+                        <option value="🇸🇦">🇸🇦 サウジ</option>
+                        <option value="🇹🇭">🇹🇭 タイ</option>
+                        <option value="🇻🇳">🇻🇳 ベトナム</option>
+                        <option value="🇵🇭">🇵🇭 フィリピン</option>
+                        <option value="🇻🇪">🇻🇪 ベネズエラ</option>
+                        <option value="🍂">🍂 落ち葉</option>
+                    </select>
+                    <input type="text" id="team-input" class="login-input" placeholder="チーム (3文字)" maxlength="3"
+                        style="flex:1;">
+                </div>
+                <select id="team-select" class="login-input" style="margin-top: 10px; display:none; cursor:pointer;"
+                    onchange="selectExistingTeam(this.value)">
+                    <option value="">既存チームから選択</option>
+                </select>
+                <div id="player-image-row" style="margin-top:10px; display:none; align-items:center; gap:8px;">
+                    <label
+                        style="cursor:pointer; background:#334155; color:#cbd5e1; padding:6px 12px; border-radius:6px; font-size:0.85rem; white-space:nowrap;">
+                        🖼️ 画像
+                        <input type="file" id="player-image-input" accept="image/*" style="display:none;"
+                            onchange="handleImageUpload(this)">
+                    </label>
+                    <div id="player-image-preview" style="display:none; position:relative;">
+                        <img id="player-image-thumb"
+                            style="width:40px; height:40px; border-radius:6px; object-fit:cover; border:1px solid #475569;">
+                        <span onclick="clearUploadedImage()"
+                            style="position:absolute; top:-6px; right:-6px; background:#ef4444; color:#fff; border-radius:50%; width:16px; height:16px; display:flex; align-items:center; justify-content:center; font-size:10px; cursor:pointer; line-height:1;">✕</span>
+                    </div>
+                    <span id="player-image-status" style="color:#64748b; font-size:0.75rem;"></span>
+                </div>
+                <button class="action-btn" onclick="startGame()">ゲームスタート</button>
+                <div style="display:flex; gap:10px; margin-top:10px;">
+                    <button class="action-btn" style="background:#475569; flex:1;" onclick="showHistoryModal()">📊
+                        ランキング</button>
+                    <button class="action-btn" style="background:#475569; flex:1;" onclick="showSettingsModal()">⚙️
+                        設定</button>
+                </div>
+                <div style="margin-top:30px; text-align:center;">
+                    <a href="https://github.com/satorunet/onj-jintori" target="_blank" rel="noopener"
+                        style="color:#64748b; text-decoration:none; font-size:0.8rem; display:inline-flex; align-items:center; gap:4px;">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                            <path
+                                d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z" />
+                        </svg>
+                        GitHub
+                    </a>
+                    <span style="color:#475569; margin:0 4px;">|</span>
+                    <a href="https://github.com/satorunet/onj-jintori/commits" target="_blank" rel="noopener"
+                        style="color:#64748b; text-decoration:none; font-size:0.8rem;">開発履歴</a>
+                    <span style="color:#475569; margin:0 4px;">|</span>
+                    <a href="#" onclick="document.getElementById('help-modal').style.display='flex';return false;"
+                        style="color:#64748b; text-decoration:none; font-size:0.8rem;">遊び方</a>
+                    <div style="margin-top:20px;">
+                        <a href="https://hexanaut.io/" target="_blank" rel="noopener"
+                            style="color:#475569; text-decoration:none; font-size:0.7rem;">元ネタ：hexanaut.io</a>
+                        <span style="color:#334155; margin:0 4px;">|</span>
+                        <a href="https://satoru.net/" target="_blank" rel="noopener"
+                            style="color:#475569; text-decoration:none; font-size:0.7rem;">&copy;satoru.net</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Help Modal -->
+        <div id="help-modal" class="modal" style="display:none;">
+            <div class="modal-box"
+                style="max-width:500px; max-height:80vh; overflow-y:auto; text-align:left; line-height:1.8;">
+                <div class="modal-title" style="margin-bottom:14px;"><i class="fa-solid fa-book-open"
+                        style="margin-right:6px;"></i>遊び方</div>
+                <div style="font-size:0.85rem; color:#cbd5e1;">
+                    <p style="margin:0 0 14px; color:#94a3b8; font-size:0.9rem;">陣地を広げてスコア1位を目指すリアルタイム陣取りゲームだよ。</p>
+                    <div style="text-align:center; margin-bottom:14px;">
+                        <img src="https://github.com/satorunet/onj-jintori/raw/main/docs/images/game-preview.png"
+                            alt="ゲーム画面" style="max-width:100%; border-radius:8px; border:1px solid #334155;">
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #f472b6;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-flag" style="margin-right:5px; color:#f472b6;"></i>基本ルール</div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-draw-polygon"
+                                    style="color:#34d399; width:18px;"></i> 自分の陣地から出て動いて、陣地に戻ると囲んだところが自分の領地になるよ</li>
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-crosshairs"
+                                    style="color:#fb923c; width:18px;"></i> 敵が引いてる線（トレイル）に触れると相手を倒せる</li>
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-burst"
+                                    style="color:#f87171; width:18px;"></i> 正面衝突すると両方とも死ぬから気をつけてね</li>
+                            <li><i class="fa-solid fa-clock" style="color:#a78bfa; width:18px;"></i>
+                                1ラウンド2分。終わった時にスコア1位の人が勝ち！</li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #22d3ee;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-gamepad" style="margin-right:5px; color:#22d3ee;"></i>操作方法</div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-mobile-screen"
+                                    style="color:#a78bfa; width:18px;"></i> <b>スマホ：</b>画面スワイプで移動</li>
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-keyboard"
+                                    style="color:#94a3b8; width:18px;"></i> <b>PC：</b>矢印キーで移動</li>
+                            <li><i class="fa-solid fa-bolt" style="color:#facc15; width:18px;"></i> <b>ブースト：</b>スペースキー
+                                or ゲージタップ（1.8倍速 / 2秒間）</li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #fb923c;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-layer-group" style="margin-right:5px; color:#fb923c;"></i>ゲームモード
+                        </div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-user"
+                                    style="color:#38bdf8; width:18px;"></i> <b>個人戦：</b>全員敵。自分の腕だけが頼り</li>
+                            <li><i class="fa-solid fa-users" style="color:#4ade80; width:18px;"></i>
+                                <b>チーム戦：</b>同じチーム名の人が味方になって、チーム合計スコアで勝負</li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #4ade80;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-people-group" style="margin-right:5px; color:#4ade80;"></i>チーム戦の特徴
+                        </div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-handshake"
+                                    style="color:#60a5fa; width:18px;"></i> 味方の陣地は共有だよ</li>
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-comments"
+                                    style="color:#c084fc; width:18px;"></i> チームチャットで連携できる</li>
+                            <li><i class="fa-solid fa-link" style="color:#2dd4bf; width:18px;"></i>
+                                近くの味方をタップして連結（チェーン）すると一緒に動けるよ</li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #f87171;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-heart-pulse" style="margin-right:5px; color:#f87171;"></i>死亡・リスポーン
+                        </div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-rotate-right"
+                                    style="color:#34d399; width:18px;"></i> やられても3秒で復活するから大丈夫</li>
+                            <li><i class="fa-solid fa-ghost" style="color:#94a3b8; width:18px;"></i>
+                                短時間に何回も死ぬとゴーストペナルティ（しばらく動けない）くらうよ</li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #facc15;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-lightbulb" style="margin-right:5px; color:#facc15;"></i>コツ</div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-shield-halved"
+                                    style="color:#60a5fa; width:18px;"></i> 小さく囲んでコツコツ広げるのが安全だよ</li>
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-fire"
+                                    style="color:#f97316; width:18px;"></i> 大きく囲むのはハイリスク・ハイリターン</li>
+                            <li><i class="fa-solid fa-wand-magic-sparkles" style="color:#e879f9; width:18px;"></i>
+                                敵のトレイルを狙って倒して陣地を奪っちゃおう！</li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="margin:18px 0 8px; font-weight:bold; color:#e2e8f0; font-size:0.95rem; border-bottom:1px solid #334155; padding-bottom:6px;">
+                        <i class="fa-solid fa-star" style="margin-right:5px; color:#fbbf24;"></i>いろんな機能たち
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #38bdf8;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-bolt" style="margin-right:5px; color:#facc15;"></i>ブースト</div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-gauge-high"
+                                    style="color:#facc15; width:18px;"></i> 一瞬だけ1.8倍速で移動できる加速機能</li>
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-hand-pointer"
+                                    style="color:#38bdf8; width:18px;"></i> スペースキー or 画面下のゲージをタップで発動</li>
+                            <li><i class="fa-solid fa-hourglass-half" style="color:#fb923c; width:18px;"></i>
+                                2秒間持続して、5秒のクールダウンがあるよ</li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #2dd4bf;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-link" style="margin-right:5px; color:#2dd4bf;"></i>チェーン（連結）</div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-people-arrows"
+                                    style="color:#4ade80; width:18px;"></i> チーム戦で味方の近くに行くと連結できる</li>
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-arrow-pointer"
+                                    style="color:#60a5fa; width:18px;"></i> 近くの味方をタップ or Enterキーでくっつくよ</li>
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-person-walking"
+                                    style="color:#a78bfa; width:18px;"></i> リーダーが動くとみんなついていく</li>
+                            <li><i class="fa-solid fa-scissors" style="color:#f87171; width:18px;"></i>
+                                切り離したい時は🔗マークをタップ</li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #c084fc;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-comments" style="margin-right:5px; color:#c084fc;"></i>チームチャット</div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-message"
+                                    style="color:#93c5fd; width:18px;"></i> チーム戦中に味方とリアルタイムで会話できる</li>
+                            <li><i class="fa-solid fa-skull-crossbones" style="color:#f87171; width:18px;"></i>
+                                キルログやチーム戦況も確認できるよ</li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; margin-bottom:10px; border-left:3px solid #f0abfc;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-face-smile" style="margin-right:5px; color:#f0abfc;"></i>絵文字・カスタマイズ
+                        </div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-icons"
+                                    style="color:#fbbf24; width:18px;"></i> 好きな絵文字をアイコンにできる</li>
+                            <li><i class="fa-solid fa-flag" style="color:#34d399; width:18px;"></i> 国旗を選んで自分のチームをアピール
+                            </li>
+                        </ul>
+                    </div>
+
+                    <div
+                        style="background:#1e293b; border-radius:8px; padding:10px 12px; border-left:3px solid #94a3b8;">
+                        <div style="font-weight:bold; color:#f0f0f0; margin-bottom:6px; font-size:0.9rem;"><i
+                                class="fa-solid fa-trophy" style="margin-right:5px; color:#fbbf24;"></i>ランキング</div>
+                        <ul style="margin:0; padding-left:0.5em; list-style:none;">
+                            <li style="margin-bottom:3px;"><i class="fa-solid fa-chart-simple"
+                                    style="color:#60a5fa; width:18px;"></i> 勝利数やキル数がデータベースに記録される</li>
+                            <li><i class="fa-solid fa-calendar-day" style="color:#fb923c; width:18px;"></i>
+                                今日のランキング・累計ランキングが見れるよ</li>
+                        </ul>
+                    </div>
+                </div>
+                <button class="action-btn" style="margin-top:16px;"
+                    onclick="document.getElementById('help-modal').style.display='none'">閉じる</button>
+            </div>
+        </div>
+
+        <!-- History Modal -->
+        <div id="history-modal" class="modal" style="display: none;">
+            <div class="modal-box" style="max-width:600px; max-height:80vh; overflow-y:auto;">
+                <div class="modal-title" style="margin-bottom:10px;">📊 ランキング</div>
+                <div id="ranking-subtitle"
+                    style="text-align:center; color:#94a3b8; font-size:0.9rem; margin-bottom:15px;">
+                    読み込み中...
+                </div>
+
+                <div style="display:flex; justify-content:center; gap:10px; margin-bottom:15px;">
+                    <button id="period-btn-today" class="action-btn"
+                        style="width:100px; padding:6px; font-size:0.9rem; background:#3b82f6;"
+                        onclick="switchPeriod('today')">今日</button>
+                    <button id="period-btn-all" class="action-btn"
+                        style="width:100px; padding:6px; font-size:0.9rem; background:#475569;"
+                        onclick="switchPeriod('all')">通算</button>
+                </div>
+
+                <div style="display:flex; gap:5px; margin-bottom:15px; justify-content:center; flex-wrap:nowrap;">
+                    <button id="history-tab-teams" class="action-btn"
+                        style="flex:1; min-width:50px; padding:8px 2px; font-size:0.75rem;"
+                        onclick="loadHistoryTab('teams')">チーム<br>(累計)</button>
+                    <button id="history-tab-teams-best" class="action-btn"
+                        style="flex:1; min-width:50px; padding:8px 2px; font-size:0.75rem; background:#475569;"
+                        onclick="loadHistoryTab('teams-best')">チーム<br>(最高)</button>
+                    <button id="history-tab-players" class="action-btn"
+                        style="flex:1; min-width:50px; padding:8px 2px; font-size:0.75rem; background:#475569;"
+                        onclick="loadHistoryTab('players')">個人<br>(累計)</button>
+                    <button id="history-tab-players-best" class="action-btn"
+                        style="flex:1; min-width:50px; padding:8px 2px; font-size:0.75rem; background:#475569;"
+                        onclick="loadHistoryTab('players-best')">個人<br>(最高)</button>
+                    <button id="history-tab-rounds" class="action-btn"
+                        style="flex:1; min-width:50px; padding:8px 2px; font-size:0.75rem; background:#475569;"
+                        onclick="loadHistoryTab('rounds')">試合<br>履歴</button>
+
+                </div>
+                <div id="history-content" style="min-height:200px; max-height:350px; overflow-y:auto;">
+                    <p style="text-align:center; color:#94a3b8;">読み込み中...</p>
+                </div>
+                <button class="action-btn" style="background:#64748b; margin-top:15px;"
+                    onclick="hideHistoryModal()">閉じる</button>
+            </div>
+        </div>
+
+        <!-- Settings Modal -->
+        <div id="settings-modal" class="modal" style="display: none;">
+            <div class="modal-box" style="max-width:400px;">
+                <div class="modal-title" style="margin-bottom:20px;">⚙️ 設定</div>
+
+                <div style="margin-bottom:20px;">
+                    <div style="color:#94a3b8; font-size:0.85rem; margin-bottom:8px;">描画品質</div>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        <button id="perf-auto" class="setting-btn" onclick="setPerformanceMode('auto')">
+                            🔄 自動
+                        </button>
+                        <button id="perf-high" class="setting-btn" onclick="setPerformanceMode('high')">
+                            ✨ 高品質
+                        </button>
+                        <button id="perf-low" class="setting-btn" onclick="setPerformanceMode('low')">
+                            ⚡ 軽量
+                        </button>
+                    </div>
+                    <div id="perf-description" style="color:#64748b; font-size:0.75rem; margin-top:8px;">
+                        FPSに応じて自動的に切り替えます
+                    </div>
+                </div>
+
+                <div style="border-top:1px solid #334155; padding-top:15px; margin-top:15px;">
+                    <div style="color:#64748b; font-size:0.75rem;">
+                        💡 カクつく場合は「軽量」モードをお試しください
+                    </div>
+                </div>
+
+                <button class="action-btn" style="background:#64748b; margin-top:20px;"
+                    onclick="hideSettingsModal()">閉じる</button>
+            </div>
+        </div>
+
+        <!-- 次のラウンドカウントダウン（画面上部固定） -->
+        <div id="next-round-countdown" style="
+        display: none;
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 10000;
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.95) 0%, rgba(15, 23, 42, 0.8) 100%);
+        padding: 6px 12px;
+        text-align: center;
+        border-bottom: 1px solid #3b82f6;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    ">
+            <div style="color: #fff; font-size: 13px; font-weight: normal;">
+                <span id="next-round-countdown-text">15秒後に次のラウンドへ...</span>
+            </div>
+        </div>
+
+        <!-- Result Screen -->
+        <div id="result-modal" class="modal" style="display: none;">
+            <div class="modal-box">
+                <div class="modal-title" id="result-title">ラウンド終了</div>
+                <div style="display:flex; flex-direction:column; align-items:center; margin-bottom:10px;">
+                    <canvas id="result-map" width="300" height="300"
+                        style="background:rgba(0,0,0,0.5); border:1px solid #475569; width:200px; height:200px;"></canvas>
+                </div>
+                <div style="max-height: 500px; overflow-y: auto;">
+                    <div style="display:flex; flex-direction:column; gap:15px;">
+                        <div id="result-team-area" style="display:none;">
+                            <div style="font-size:0.9rem; color:#94a3b8; margin-bottom:5px; text-align:left;">チーム順位
+                            </div>
+                            <div style="max-height: 200px; overflow-y: auto;">
+                                <table class="result-table">
+                                    <thead>
+                                        <tr>
+                                            <th>-</th>
+                                            <th>ﾁｰﾑ</th>
+                                            <th>泉</th>
+                                            <th>キル</th>
+                                            <th>占領</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="result-team-body"></tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <div>
+                            <div style="font-size:0.9rem; color:#94a3b8; margin-bottom:5px; text-align:left;">個人順位</div>
+                            <div style="max-height: 260px; overflow-y: auto;">
+                                <table class="result-table">
+                                    <thead>
+                                        <tr>
+                                            <th>-</th>
+                                            <th>名前</th>
+                                            <th>泉接続数</th>
+                                            <th>キル</th>
+                                            <th>占領</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="result-body"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="result-hourly-graph"
+                    style="display:none; margin-top:12px; padding:8px 10px; background:rgba(0,0,0,0.3); border-radius:8px; border:1px solid #334155;">
+                    <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:4px;">
+                        <button id="result-cup-hourly" class="hourly-tab-btn active"
+                            onclick="switchCupPeriod('result','hourly')">🏆 時間杯</button>
+                        <button id="result-cup-daily" class="hourly-tab-btn"
+                            onclick="switchCupPeriod('result','daily')">📅 1日杯</button>
+                    </div>
+                    <div style="display:flex; align-items:center; justify-content:center; gap:6px; margin-bottom:6px;">
+                        <button id="result-hourly-tab-team" class="hourly-tab-btn active"
+                            onclick="switchHourlyTab('result', 'team')">チーム</button>
+                        <button id="result-hourly-tab-player" class="hourly-tab-btn"
+                            onclick="switchHourlyTab('result', 'player')">個人</button>
+                    </div>
+                    <div id="result-hourly-bars"></div>
+                    <div id="result-cup-expand"
+                        style="text-align:center; margin:-1px 0 -4px; display:none; line-height:1;">
+                        <i class="fas fa-angles-down" id="result-cup-expand-icon" onclick="toggleCupExpand('result')"
+                            style="color:#cbd5e1; cursor:pointer; font-size:8px; opacity:0.7;"
+                            onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.7'"></i>
+                    </div>
+                </div>
+                <div id="result-next-mode-ui"></div>
+                <div id="result-chat-footer"
+                    style="position:sticky; bottom:0; background:#1e293b; padding:8px 0 0; z-index:2; border-top:1px solid #334155; margin-top:10px;">
+                    <div style="display:flex; gap:5px;">
+                        <input type="text" id="chat-input" placeholder="コメント (最大15文字)" maxlength="15"
+                            style="flex:1; padding:8px; border-radius:6px; border:1px solid #475569; background:#1e293b; color:#fff; font-size:14px;"
+                            onkeydown="if(event.key==='Enter') sendChat()">
+                        <button onclick="sendChat()"
+                            style="padding:8px 15px; border-radius:6px; background:#3b82f6; color:#fff; border:none; cursor:pointer; font-size:14px; font-weight:bold;">送信</button>
+                    </div>
+                    <div id="next-round-msg" style="margin-top:8px; color:#94a3b8; text-align:center;">15秒後に次のラウンドへ...
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="ui-layer">
+            <div id="event-banner"
+                style="display:none; position:absolute; top:4px; left:50%; transform:translateX(-50%); background:linear-gradient(90deg,#f59e0b,#ef4444,#f59e0b); color:#fff; font-weight:bold; font-size:13px; padding:4px 16px; border-radius:20px; z-index:100; text-shadow:0 1px 2px rgba(0,0,0,0.5); animation:pulse 1.5s infinite; white-space:nowrap;">
+            </div>
+            <div class="score-panel">
+                <div class="stat-box">
+                    <div class="stat-label">参加</div>
+                    <div class="stat-value" id="pCount">0</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">占領</div>
+                    <div class="stat-value" id="scoreVal">0.00%</div>
+                </div>
+                <div id="timer">2:00</div>
+                <canvas id="minimap" width="54" height="54"
+                    style="width:54px; height:54px; background:rgba(0,0,0,0.5); border:1px solid #475569; border-radius:4px; margin-left:10px; align-self:center;"></canvas>
+            </div>
+
+            <div id="leaderboard">
+                <div class="lb-title">トップランカー</div>
+                <div id="lb-list">
+                    <!-- JS Populated -->
+                </div>
+                <div id="team-lb-container"
+                    style="display:none; margin-top:12px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.2);">
+                    <div class="lb-title">チーム</div>
+                    <div id="lb-team-list"></div>
+                </div>
+            </div>
+
+            <div id="kill-feed"></div>
+
+            <div id="mode-display"
+                style="position: absolute; top: 10px; left: 50%; transform: translateX(-50%); font-size: 1.2rem; font-weight: bold; color: rgba(255,255,255,0.8); text-shadow: 0 0 5px #000; pointer-events: none; text-align:center;">
+                SOLO ROUND
+            </div>
+
+            <div id="instruction-overlay">
+                &nbsp;
+            </div>
+
+            <div id="deathScreen" class="kill-msg">
+                <div class="kill-title">死亡</div>
+                <div id="deathReason" style="margin-top:10px; font-size:1.2rem; color:#f87171;"></div>
+                <div class="kill-sub">復活まで <span id="respawnTime">5</span>...</div>
+            </div>
+
+            <div id="ghostScreen" class="kill-msg"
+                style="display:none; border: 2px solid #818cf8; background:rgba(30,27,75,0.92); top:auto; bottom:55px; transform:translateX(-50%); padding:8px 14px;">
+                <div class="kill-title" style="color:#a5b4fc; font-size:1.3rem;">👻 ゴースト状態</div>
+                <div style="margin-top:4px; font-size:0.75rem; color:#c4b5fd;">短時間で連続死亡の為、待機ペナルティが発生しました</div>
+                <div id="ghostPenaltyInfo" style="margin-top:3px; font-size:0.85rem; color:#a5b4fc; font-weight:bold;">
+                </div>
+                <div class="kill-sub" style="color:#a5b4fc; font-size:0.8rem; margin-top:2px;">復活まで <span
+                        id="ghostTime">0</span>秒</div>
+            </div>
+        </div>
+
+        <div id="nico-layer"
+            style="position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:9999; overflow:hidden;">
+        </div>
+
+        <!-- Team Chat -->
+        <div id="team-chat" style="
+        display: none;
+        position: absolute;
+        bottom: 80px;
+        right: 10px;
+        width: 220px;
+        z-index: 10001;
+        pointer-events: auto;
+    ">
+            <div style="
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px solid #3b82f6;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 10px rgba(59, 130, 246, 0.3);
+        ">
+                <div id="team-chat-header" style="
+                background: rgba(59, 130, 246, 0.3);
+                padding: 4px 8px;
+                font-size: 11px;
+                color: #93c5fd;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                cursor: grab;
+                user-select: none;
+                -webkit-user-select: none;
+            ">🚩 <span id="team-chat-team-name"></span>
+                    <span onclick="closeTeamChat()"
+                        style="margin-left:auto; cursor:pointer; color:#94a3b8; font-size:14px; line-height:1;">✕</span>
+                </div>
+                <!-- タブ -->
+                <div style="display:flex; border-bottom:1px solid #334155;">
+                    <div id="tc-tab-chat" onclick="switchTeamTab('chat')"
+                        style="flex:1; text-align:center; padding:4px 0; font-size:10px; color:#93c5fd; cursor:pointer; background:rgba(59,130,246,0.15); border-bottom:2px solid #3b82f6;">
+                        💬</div>
+                    <div id="tc-tab-team" onclick="switchTeamTab('team')"
+                        style="flex:1; text-align:center; padding:4px 0; font-size:10px; color:#64748b; cursor:pointer; border-bottom:2px solid transparent;">
+                        👥</div>
+                    <div id="tc-tab-log" onclick="switchTeamTab('log')"
+                        style="flex:1; text-align:center; padding:4px 0; font-size:10px; color:#64748b; cursor:pointer; border-bottom:2px solid transparent;">
+                        ⚔️</div>
+                </div>
+                <!-- 会話タブ -->
+                <div id="tc-panel-chat">
+                    <div id="team-chat-messages" style="
+                    height: 100px;
+                    overflow-y: auto;
+                    padding: 4px 6px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 2px;
+                "></div>
+                    <div style="display:flex; border-top: 1px solid #334155; align-items:center;">
+                        <label id="team-image-label"
+                            style="cursor:pointer; padding:5px 6px; color:#93c5fd; font-size:14px; flex-shrink:0; display:none;"
+                            title="画像提案">
+                            🖼️
+                            <input type="file" id="team-image-input" accept="image/*" style="display:none;"
+                                onchange="handleTeamImageUpload(this)">
+                        </label>
+                        <input type="text" id="team-chat-input" placeholder="メッセージ" maxlength="20"
+                            style="flex:1; padding:5px 6px; border:none; background:transparent; color:#fff; font-size:12px; outline:none;"
+                            onkeydown="if(event.key==='Enter') sendTeamChat()">
+                        <button onclick="sendTeamChat()"
+                            style="padding:5px 8px; background:#3b82f6; color:#fff; border:none; cursor:pointer; font-size:11px;">送信</button>
+                    </div>
+                </div>
+                <!-- 自軍タブ -->
+                <div id="tc-panel-team" style="display:none; height:130px; overflow-y:auto; padding:4px 6px;">
+                    <div id="tc-team-stats"></div>
+                    <div id="team-img-current"
+                        style="display:none; text-align:center; margin-top:4px; padding-top:4px; border-top:1px solid #334155;">
+                        <img id="team-img-thumb"
+                            style="width:40px; height:40px; border-radius:4px; object-fit:cover; border:1px solid #475569;">
+                        <div style="font-size:10px; color:#64748b;">チーム画像</div>
+                    </div>
+                </div>
+                <!-- 戦歴タブ -->
+                <div id="tc-panel-log" style="display:none; height:130px; overflow-y:auto; padding:4px 6px;">
+                </div>
+            </div>
+        </div>
+
+        <!-- Team Chat Badge -->
+        <div id="team-chat-badge" onclick="openTeamChat()" style="
+        display: none;
+        position: absolute;
+        bottom: 80px;
+        right: 10px;
+        z-index: 10001;
+        pointer-events: auto;
+        cursor: pointer;
+        background: rgba(59, 130, 246, 0.9);
+        border-radius: 50%;
+        width: 44px;
+        height: 44px;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 2px 8px rgba(59, 130, 246, 0.5);
+    ">
+            <span style="font-size: 20px;">💬</span>
+            <span id="team-chat-badge-count" style="
+            position: absolute;
+            top: -4px;
+            right: -4px;
+            background: #ef4444;
+            color: #fff;
+            font-size: 11px;
+            font-weight: bold;
+            min-width: 18px;
+            height: 18px;
+            border-radius: 9px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0 4px;
+        ">0</span>
+        </div>
+
+        <!-- 連結解除ボタン -->
+        <div id="chain-detach-badge" onclick="triggerChainDetach()" style="
+        display: none;
+        position: absolute;
+        bottom: 130px;
+        right: 10px;
+        z-index: 10001;
+        pointer-events: auto;
+        cursor: pointer;
+        background: rgba(220, 38, 38, 0.9);
+        border-radius: 50%;
+        width: 44px;
+        height: 44px;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 2px 8px rgba(220, 38, 38, 0.5);
+        font-size: 20px;
+        color: #fff;
+    ">🔗</div>
+
+        <!-- Virtual Joystick Visuals -->
+        <div id="virtual-joystick-base">
+            <div id="virtual-joystick-stick"></div>
+        </div>
+
+    </div><!-- /game-container -->
+
+    <!-- pako library for gzip decompression -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+
+    <!-- Client Scripts (分離版) -->
+    <script src="client/client-config.js?v=2603041607"></script>
+    <script src="client/client-network.js?v=2603041607"></script>
+    <script src="client/client-game.js?v=2603041607"></script>
+    <script src="client/client-ui.js?v=2603041607"></script>
+</body>
+
+</html>

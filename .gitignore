@@ -1,0 +1,5 @@
+node_modules/
+.vscode/
+bkup/
+admin-credentials.json
+server-credentials.json
