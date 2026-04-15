@@ -6,7 +6,8 @@
 //const SERVER_URL = 'wss://new-node01.open2ch.net:2087';
 //const SERVER_URL = 'wss://jintori.open2ch.net:2053';
 //!
-const SERVER_URL = "ws://localhost:2053";
+//const SERVER_URL = "ws://localhost:2053";
+const SERVER_URL = "wss://haou-jintori-rootmode.onrender.com";
 //!
 // API Base
 const API_BASE = 'https://jintori.open2ch.net:2053';
